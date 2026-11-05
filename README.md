@@ -5,9 +5,9 @@ Zeigt dauerhaft direkt über dem Eingabefeld eine Zeile mit dem aktuellen Verbra
 `Kontext 13% (127k/1000k)  ·  Alle Modelle 15% (in 6 T 20 Std)  ·  Fable 25% (in 6 T 20 Std)  ·  Sitzung $0.66`
 
 - **Kontext:** wie voll das Kontextfenster der aktuellen Sitzung ist
-- **5 Std. / Alle Modelle / Fable …:** Nutzungslimits des Plans wie unter Einstellungen → Nutzung, auch pro Modell, mit Zeit bis zum Zurücksetzen (alle 5 Min und nach jeder Antwort neu abgerufen)
+- **Alle Modelle / Fable / 5 Std.:** Nutzungslimits des Plans, genau die Zeilen der Einstellungsseite (auch pro Modell), mit Zeit bis zum Zurücksetzen; alle 5 Min und nach jeder Antwort neu abgerufen. Farbe nach der Einstufung des Servers.
 - **Sitzung:** bisherige Kosten der Sitzung
-- ab 70 % gelb, ab 90 % rot; aktualisiert sich nach jeder Antwort
+- `/verbrauch-rohdaten` zeigt den Aufbau der Limit-Daten (nur Namen und Zahlen) für die Fehlersuche
 
 ## Installation
 

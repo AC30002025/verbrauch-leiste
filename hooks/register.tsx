@@ -6,100 +6,117 @@ import type { Limit, Verbrauch } from '../types'
 const stand = atom({ plugin: 'verbrauch-leiste', key: 'stand' } as const, null)
 const plan = atom({ plugin: 'verbrauch-leiste', key: 'plan' } as const, null)
 
-// Dieselbe Quelle wie „Einstellungen → Nutzungslimits des Plans“ (inkl. Limits pro Modell).
+// Dieselbe Quelle wie „Einstellungen → Nutzungslimits des Plans“ (auch Limits pro Modell).
 const PLAN_URL = 'https://api.anthropic.com/api/oauth/usage'
 const PLAN_ABSTAND_MS = 60_000
 
+// Namen der Fenster, wie Claude Code sie selbst benennt.
+const FENSTER_NAMEN: Record<string, string> = {
+  five_hour: '5 Std.',
+  seven_day: 'Alle Modelle',
+  seven_day_overage_included: 'Fable',
+  seven_day_opus: 'Opus',
+  seven_day_sonnet: 'Sonnet',
+}
+
+function fensterName(kind: string): string | null {
+  if (kind in FENSTER_NAMEN) return FENSTER_NAMEN[kind]!
+  // Unbekannte Fenster (z. B. seven_day_cowork, seven_day_oauth_apps) zeigt auch die Einstellungsseite nicht.
+  return null
+}
+
 function baue(context: SessionContextUsage, rateLimits: SessionRateLimit[], cost?: SessionCost): Verbrauch {
+  const limits: Limit[] = []
+  for (const r of rateLimits) {
+    const n = fensterName(r.kind)
+    if (n) limits.push({ kind: n, percentUsed: r.percentUsed, resetsAt: r.resetsAt ?? null, severity: null })
+  }
   return {
     kontextProzent: context.percent ?? null,
     kontextTokens: context.tokens ?? null,
     fenster: context.window,
-    limits: rateLimits.map(r => ({ kind: schoen(r.kind), percentUsed: r.percentUsed, resetsAt: r.resetsAt ?? null })),
+    limits,
     usd: cost ? cost.usd : null,
   }
 }
 
-const AUSBLENDEN = /extra|overage|credit|spend|billing/i
-const LABEL_FELDER = ['display_name', 'model_name', 'model', 'name', 'label', 'title']
+type Obj = Record<string, unknown>
+const istObj = (v: unknown): v is Obj => !!v && typeof v === 'object' && !Array.isArray(v)
+const text = (v: unknown): string | null => (typeof v === 'string' && v.length > 0 ? v : null)
+const zahl = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null)
 
-function schoen(roh: string): string {
-  if (roh === 'five_hour') return '5 Std.'
-  if (roh === 'seven_day') return 'Alle Modelle'
-  const m = /^seven_day_(.+)$/.exec(roh)
-  const rest = m ? m[1]! : roh
-  return rest
-    .split(/[_\s-]+/)
-    .filter(Boolean)
-    .map(w => w[0]!.toUpperCase() + w.slice(1))
-    .join(' ')
-}
-
-function zahl(o: Record<string, unknown>): number | null {
-  for (const k of ['utilization', 'percent_used', 'percentUsed', 'used_percentage', 'percent']) {
-    const v = o[k]
-    if (typeof v === 'number' && Number.isFinite(v)) return v
-  }
-  return null
-}
-
-function zeit(o: Record<string, unknown>): string | null {
-  for (const k of ['resets_at', 'resetsAt', 'reset_at', 'resets']) {
-    const v = o[k]
-    if (typeof v === 'string') return v
-  }
-  return null
-}
-
-// Durchsucht die ganze Antwort (auch verschachtelt, auch Listen) nach Fenstern mit Prozentwert.
-function planLimits(json: unknown): Limit[] {
+// Liest die Zeilen der Antwort (`limits[]`), wie Claude Code sie beschreibt:
+// kind 'session' | 'weekly_all' | 'weekly_scoped', percent 0–100, resets_at, scope.model.display_name, severity.
+function ausZeilen(rows: unknown[]): Limit[] {
   const out: Limit[] = []
-  const gesehen = new Set<string>()
-  const lauf = (v: unknown, pfad: string[], tiefe: number) => {
-    if (tiefe > 5 || !v || typeof v !== 'object') return
-    if (Array.isArray(v)) {
-      v.forEach((x, i) => lauf(x, [...pfad, String(i)], tiefe + 1))
-      return
-    }
-    const o = v as Record<string, unknown>
-    const p = zahl(o)
-    if (p !== null) {
-      const benannt = LABEL_FELDER.map(k => o[k]).find((x): x is string => typeof x === 'string' && x.length > 0)
-      const schluessel = [...pfad].reverse().find(k => !/^\d+$/.test(k)) ?? 'limit'
-      const pfadText = pfad.join('.')
-      if (!AUSBLENDEN.test(pfadText)) {
-        const label = benannt ? schoen(benannt) : schoen(schluessel)
-        if (!gesehen.has(label)) {
-          gesehen.add(label)
-          out.push({ kind: label, percentUsed: Math.round(p * 10) / 10, resetsAt: zeit(o) })
-        }
-      }
-    }
-    for (const [k, x] of Object.entries(o)) {
-      if (x && typeof x === 'object') lauf(x, [...pfad, k], tiefe + 1)
-    }
+  for (const row of rows) {
+    if (!istObj(row)) continue
+    const percent = zahl(row.percent)
+    const kind = text(row.kind) ?? ''
+    if (percent === null) continue
+    const scope = istObj(row.scope) ? row.scope : null
+    const model = scope && istObj(scope.model) ? text(scope.model.display_name) : null
+    const surface = scope && istObj(scope.surface) ? text(scope.surface.display_name) : null
+    let name: string | null = null
+    if (kind === 'session') name = '5 Std.'
+    else if (kind === 'weekly_all') name = 'Alle Modelle'
+    else if (model) name = model
+    else if (surface) continue // Aufteilung nach Oberfläche (Claude Code / Chats / Cowork) ist kein Limit
+    else continue
+    if (out.some(l => l.kind === name)) continue
+    out.push({
+      kind: name,
+      percentUsed: Math.round(percent * 10) / 10,
+      resetsAt: text(row.resets_at),
+      severity: text(row.severity),
+    })
   }
-  lauf(json, [], 0)
-  const rang = (k: string) => (k === '5 Std.' ? 0 : k === 'Alle Modelle' ? 1 : 2)
-  return out.sort((a, b) => rang(a.kind) - rang(b.kind))
+  return out
 }
 
-// Zeigt den Aufbau der Antwort: Schlüssel, Zahlen, kurze Texte – für die Fehlersuche.
+// Ältere Antworten ohne `limits[]`: die Fenster liegen oben, utilization in Prozent.
+function ausFenstern(json: Obj): Limit[] {
+  const out: Limit[] = []
+  for (const kind of Object.keys(FENSTER_NAMEN)) {
+    const v = json[kind]
+    if (!istObj(v)) continue
+    const p = zahl(v.utilization)
+    if (p === null) continue
+    out.push({
+      kind: FENSTER_NAMEN[kind]!,
+      percentUsed: Math.round(p * 10) / 10,
+      resetsAt: text(v.resets_at),
+      severity: null,
+    })
+  }
+  return out
+}
+
+export function planLimits(json: unknown): Limit[] {
+  if (!istObj(json)) return []
+  const rows = json.limits
+  if (Array.isArray(rows)) {
+    const aus = ausZeilen(rows)
+    if (aus.length > 0) return aus
+  }
+  return ausFenstern(json)
+}
+
+// Zeigt den Aufbau der Antwort (Schlüssel, Zahlen, kurze Texte) – für die Fehlersuche.
 function aufbau(v: unknown, tiefe = 0): unknown {
   if (tiefe > 6) return '…'
   if (v === null || typeof v === 'number' || typeof v === 'boolean') return v
   if (typeof v === 'string') return v.length <= 40 ? v : `<Text ${v.length} Zeichen>`
   if (Array.isArray(v)) return v.slice(0, 20).map(x => aufbau(x, tiefe + 1))
   if (typeof v === 'object') {
-    const r: Record<string, unknown> = {}
-    for (const [k, x] of Object.entries(v as Record<string, unknown>)) r[k] = aufbau(x, tiefe + 1)
+    const r: Obj = {}
+    for (const [k, x] of Object.entries(v as Obj)) r[k] = aufbau(x, tiefe + 1)
     return r
   }
   return typeof v
 }
 
 let letzteRohdaten = ''
-
 let letzterAbruf = 0
 
 async function holePlan($: EngineInterface, erzwingen = false): Promise<void> {
@@ -108,21 +125,24 @@ async function holePlan($: EngineInterface, erzwingen = false): Promise<void> {
   letzterAbruf = jetzt
   try {
     const a = await $.session.authorize()
-    if (!a || a.kind !== 'bearer') return
+    if (!a || a.kind !== 'bearer') {
+      letzteRohdaten = 'Keine Claude-Anmeldung in dieser Sitzung – Plan-Limits nicht abrufbar.'
+      return
+    }
     const res = await $.http.fetch(PLAN_URL, {
       auth: a.handle,
       headers: { 'anthropic-beta': 'oauth-2025-04-20', accept: 'application/json' },
     })
     if (!res.ok) {
-      letzteRohdaten = `Abruf fehlgeschlagen: HTTP ${res.status}`
+      letzteRohdaten = `Abruf fehlgeschlagen: HTTP ${res.status}\n${res.text.slice(0, 300)}`
       return
     }
     const json: unknown = JSON.parse(res.text)
     letzteRohdaten = JSON.stringify(aufbau(json), null, 2)
     const limits = planLimits(json)
     if (limits.length > 0) await update($, plan, () => ({ limits, abgerufen: jetzt }))
-  } catch {
-    // Abruf fehlgeschlagen: die Leiste zeigt weiter die Werte aus der letzten Antwort.
+  } catch (err) {
+    letzteRohdaten = `Abruf fehlgeschlagen: ${err instanceof Error ? err.message : String(err)}`
   }
 }
 
@@ -141,9 +161,12 @@ function reset(iso: string | null, jetzt: number): string {
   return ` (in ${Math.floor(std / 24)} T ${std % 24} Std)`
 }
 
-function farbe(p: number): string | undefined {
-  if (p >= 90) return 'red'
-  if (p >= 70) return 'yellow'
+function farbe(l: Limit): string | undefined {
+  if (l.severity === 'critical') return 'red'
+  if (l.severity === 'warning') return 'yellow'
+  if (l.severity) return undefined
+  if (l.percentUsed >= 90) return 'red'
+  if (l.percentUsed >= 70) return 'yellow'
   return undefined
 }
 
@@ -198,20 +221,21 @@ export const register: Register = on => {
 
     const teile: { key: string; text: string; color?: string }[] = []
     if (s !== null) {
+      const k = s.kontextProzent
       teile.push({
         key: 'kontext',
         text:
-          s.kontextProzent === null
+          k === null
             ? `Kontext –/${kTok(s.fenster)}`
-            : `Kontext ${s.kontextProzent}% (${kTok(s.kontextTokens ?? 0)}/${kTok(s.fenster)})`,
-        color: s.kontextProzent === null ? undefined : farbe(s.kontextProzent),
+            : `Kontext ${k}% (${kTok(s.kontextTokens ?? 0)}/${kTok(s.fenster)})`,
+        color: k === null ? undefined : k >= 90 ? 'red' : k >= 70 ? 'yellow' : undefined,
       })
     }
     for (const l of limits) {
       teile.push({
         key: l.kind,
         text: `${l.kind} ${l.percentUsed}%${reset(l.resetsAt, jetzt)}`,
-        color: farbe(l.percentUsed),
+        color: farbe(l),
       })
     }
     if (s !== null && s.usd !== null) {

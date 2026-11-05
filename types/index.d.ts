@@ -1,4 +1,9 @@
-export type Limit = { kind: string; percentUsed: number; resetsAt: string | null }
+export type Limit = {
+  kind: string
+  percentUsed: number
+  resetsAt: string | null
+  severity: string | null
+}
 
 export type Verbrauch = {
   kontextProzent: number | null
