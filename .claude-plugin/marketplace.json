@@ -1,0 +1,5 @@
+{
+  "name": "verbrauch-leiste",
+  "owner": { "name": "Ahmed Chaer" },
+  "plugins": [{ "name": "verbrauch-leiste", "source": "./" }]
+}

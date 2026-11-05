@@ -1,0 +1,1 @@
+{ "name": "verbrauch-leiste", "version": "0.1.1", "description": "Zeigt permanent über dem Eingabefeld Kontext, Limits (5 Std./7 Tage) und Kosten.", "types": "./types/index.d.ts" }
