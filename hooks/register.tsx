@@ -15,38 +15,90 @@ function baue(context: SessionContextUsage, rateLimits: SessionRateLimit[], cost
     kontextProzent: context.percent ?? null,
     kontextTokens: context.tokens ?? null,
     fenster: context.window,
-    limits: rateLimits.map(r => ({ kind: r.kind, percentUsed: r.percentUsed, resetsAt: r.resetsAt ?? null })),
+    limits: rateLimits.map(r => ({ kind: schoen(r.kind), percentUsed: r.percentUsed, resetsAt: r.resetsAt ?? null })),
     usd: cost ? cost.usd : null,
   }
 }
 
-function name(kind: string): string {
-  if (kind === 'five_hour') return '5 Std.'
-  if (kind === 'seven_day') return 'Alle Modelle'
-  if (kind === 'spend_limit') return 'Budget'
-  const m = /^seven_day_(.+)$/.exec(kind)
-  const rest = m ? m[1]! : kind
+const AUSBLENDEN = /extra|overage|credit|spend|billing/i
+const LABEL_FELDER = ['display_name', 'model_name', 'model', 'name', 'label', 'title']
+
+function schoen(roh: string): string {
+  if (roh === 'five_hour') return '5 Std.'
+  if (roh === 'seven_day') return 'Alle Modelle'
+  const m = /^seven_day_(.+)$/.exec(roh)
+  const rest = m ? m[1]! : roh
   return rest
-    .split('_')
-    .map(w => (w ? w[0]!.toUpperCase() + w.slice(1) : w))
+    .split(/[_\s-]+/)
+    .filter(Boolean)
+    .map(w => w[0]!.toUpperCase() + w.slice(1))
     .join(' ')
 }
 
-// Liest jedes Fenster mit Prozentwert aus der Antwort, egal wie viele Modelle es gibt.
+function zahl(o: Record<string, unknown>): number | null {
+  for (const k of ['utilization', 'percent_used', 'percentUsed', 'used_percentage', 'percent']) {
+    const v = o[k]
+    if (typeof v === 'number' && Number.isFinite(v)) return v
+  }
+  return null
+}
+
+function zeit(o: Record<string, unknown>): string | null {
+  for (const k of ['resets_at', 'resetsAt', 'reset_at', 'resets']) {
+    const v = o[k]
+    if (typeof v === 'string') return v
+  }
+  return null
+}
+
+// Durchsucht die ganze Antwort (auch verschachtelt, auch Listen) nach Fenstern mit Prozentwert.
 function planLimits(json: unknown): Limit[] {
   const out: Limit[] = []
-  if (!json || typeof json !== 'object') return out
-  for (const [kind, v] of Object.entries(json as Record<string, unknown>)) {
-    if (!v || typeof v !== 'object') continue
+  const gesehen = new Set<string>()
+  const lauf = (v: unknown, pfad: string[], tiefe: number) => {
+    if (tiefe > 5 || !v || typeof v !== 'object') return
+    if (Array.isArray(v)) {
+      v.forEach((x, i) => lauf(x, [...pfad, String(i)], tiefe + 1))
+      return
+    }
     const o = v as Record<string, unknown>
-    const p = typeof o.utilization === 'number' ? o.utilization : null
-    if (p === null) continue
-    const r = typeof o.resets_at === 'string' ? o.resets_at : null
-    out.push({ kind, percentUsed: Math.round(p * 10) / 10, resetsAt: r })
+    const p = zahl(o)
+    if (p !== null) {
+      const benannt = LABEL_FELDER.map(k => o[k]).find((x): x is string => typeof x === 'string' && x.length > 0)
+      const schluessel = [...pfad].reverse().find(k => !/^\d+$/.test(k)) ?? 'limit'
+      const pfadText = pfad.join('.')
+      if (!AUSBLENDEN.test(pfadText)) {
+        const label = benannt ? schoen(benannt) : schoen(schluessel)
+        if (!gesehen.has(label)) {
+          gesehen.add(label)
+          out.push({ kind: label, percentUsed: Math.round(p * 10) / 10, resetsAt: zeit(o) })
+        }
+      }
+    }
+    for (const [k, x] of Object.entries(o)) {
+      if (x && typeof x === 'object') lauf(x, [...pfad, k], tiefe + 1)
+    }
   }
-  const rang = (k: string) => (k === 'five_hour' ? 0 : k === 'seven_day' ? 1 : 2)
+  lauf(json, [], 0)
+  const rang = (k: string) => (k === '5 Std.' ? 0 : k === 'Alle Modelle' ? 1 : 2)
   return out.sort((a, b) => rang(a.kind) - rang(b.kind))
 }
+
+// Zeigt den Aufbau der Antwort: Schlüssel, Zahlen, kurze Texte – für die Fehlersuche.
+function aufbau(v: unknown, tiefe = 0): unknown {
+  if (tiefe > 6) return '…'
+  if (v === null || typeof v === 'number' || typeof v === 'boolean') return v
+  if (typeof v === 'string') return v.length <= 40 ? v : `<Text ${v.length} Zeichen>`
+  if (Array.isArray(v)) return v.slice(0, 20).map(x => aufbau(x, tiefe + 1))
+  if (typeof v === 'object') {
+    const r: Record<string, unknown> = {}
+    for (const [k, x] of Object.entries(v as Record<string, unknown>)) r[k] = aufbau(x, tiefe + 1)
+    return r
+  }
+  return typeof v
+}
+
+let letzteRohdaten = ''
 
 let letzterAbruf = 0
 
@@ -61,8 +113,13 @@ async function holePlan($: EngineInterface, erzwingen = false): Promise<void> {
       auth: a.handle,
       headers: { 'anthropic-beta': 'oauth-2025-04-20', accept: 'application/json' },
     })
-    if (!res.ok) return
-    const limits = planLimits(JSON.parse(res.text))
+    if (!res.ok) {
+      letzteRohdaten = `Abruf fehlgeschlagen: HTTP ${res.status}`
+      return
+    }
+    const json: unknown = JSON.parse(res.text)
+    letzteRohdaten = JSON.stringify(aufbau(json), null, 2)
+    const limits = planLimits(json)
     if (limits.length > 0) await update($, plan, () => ({ limits, abgerufen: jetzt }))
   } catch {
     // Abruf fehlgeschlagen: die Leiste zeigt weiter die Werte aus der letzten Antwort.
@@ -99,11 +156,20 @@ export const register: Register = on => {
     } catch {
       // keine Zahlen verfügbar – Leiste zeigt Platzhalter
     }
+    await $.command.register({
+      name: 'verbrauch-rohdaten',
+      description: 'Zeigt den Aufbau der Plan-Limits (für die Fehlersuche, ohne Zugangsdaten)',
+    })
     await holePlan($, true)
     $.clock.every(5 * 60_000, () => {
       void holePlan($)
     })
     return r
+  })
+
+  on('command.run', { command: 'verbrauch-rohdaten' }, async $ => {
+    await holePlan($, true)
+    return { text: letzteRohdaten ? '```json\n' + letzteRohdaten + '\n```' : 'Noch keine Daten abgerufen.' }
   })
 
   on('session.measure', async ($, e, next) => {
@@ -144,7 +210,7 @@ export const register: Register = on => {
     for (const l of limits) {
       teile.push({
         key: l.kind,
-        text: `${name(l.kind)} ${l.percentUsed}%${reset(l.resetsAt, jetzt)}`,
+        text: `${l.kind} ${l.percentUsed}%${reset(l.resetsAt, jetzt)}`,
         color: farbe(l.percentUsed),
       })
     }
